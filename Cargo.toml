@@ -1,0 +1,69 @@
+[package]
+name = "aitrium_dvh"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aitrium"]
+description = "DVH calculation engine in Rust for DICOM RT datasets."
+license = "MIT"
+
+[dependencies]
+# DICOM parsing
+dicom = { version = "0.7", features = ["ndarray"] }
+dicom-object = "0.7"
+dicom-encoding = "0.7"
+dicom-pixeldata = { version = "0.7", features = ["ndarray"] }
+
+# Numerical arrays and computation
+ndarray = { version = "0.15", features = ["rayon"] }
+nalgebra = "0.32"
+
+# Parallelization
+rayon = "1.10"
+crossbeam = "0.8"
+
+# Geometry
+geo = "0.28"
+geo-types = "0.7"
+
+# Memory mapping
+memmap2 = { version = "0.9", optional = true }
+
+# Error handling and utilities
+thiserror = "1.0"
+anyhow = "1.0"
+itertools = "0.13"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# CLI (optional)
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = "0.5"
+tempfile = "3.10"
+pretty_assertions = "1.4"
+
+[features]
+default = ["memmap", "cli"]
+memmap = ["memmap2"]
+cli = ["clap"]
+gpu = []  # Future GPU acceleration
+
+[[bin]]
+name = "dvh_full"
+required-features = ["cli"]
+
+[[bin]]
+name = "dvh_metrics_by_roi"
+required-features = ["cli"]
+
+# [[bench]]
+# name = "dvh_benchmark"
+# harness = false
