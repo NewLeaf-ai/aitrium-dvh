@@ -202,6 +202,11 @@ struct SyntheticGrid {
 enum ContourCombineMode {
     XorEvenOdd,
     Union,
+    /// Nesting-aware composition: classify each contour as a solid region or a
+    /// hole by containment depth, union the solids, and subtract the holes.
+    /// Correct for nested holes (which `Union` fills) AND overlapping/duplicate
+    /// solids (which `XorEvenOdd` cancels). See `combine_nesting_aware`.
+    NestingAware,
 }
 
 fn compute_margin_rtstruct_v2(
@@ -562,12 +567,15 @@ fn voxelize_roi_on_grid(
         let Some(contours) = planes.get(&OrderedFloat(nearest_z)) else {
             continue;
         };
+        // Nesting-aware so genuine holes (nested inner contours) are preserved
+        // rather than filled, while overlapping/duplicate solid contours from
+        // merged duplicate-named ROIs are not cancelled.
         let mask_2d = build_combined_mask(
             contours,
             &grid.col_lut,
             &grid.row_lut,
             0,
-            ContourCombineMode::Union,
+            ContourCombineMode::NestingAware,
         )?;
         for ((i, j), &is_inside) in mask_2d.indexed_iter() {
             if is_inside {
@@ -690,12 +698,32 @@ fn percentile_sorted(sorted: &[f64], percentile: f64) -> f64 {
 }
 
 /// Core margin calculation between two ROIs
+/// The RTDOSE-backed margin path cannot represent bilateral (Lateral)
+/// clearance: `direction_to_vector(Lateral)` is the zero vector, which the
+/// directional filter treats as "accept all points", silently degrading to a
+/// uniform margin. Reject it explicitly — callers needing lateral clearance
+/// must use `compute_margin_directed_rtstruct`, which aggregates min(left, right).
+fn ensure_dose_path_direction_supported(
+    direction: Option<MarginDirection>,
+) -> Result<(), DvhError> {
+    if direction == Some(MarginDirection::Lateral) {
+        return Err(DvhError::CalculationError(
+            "Lateral margin direction is not supported on the RTDOSE margin path; \
+             use compute_margin_directed_rtstruct for bilateral clearance"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn compute_margin(
     roi_a: &Roi,
     roi_b: &Roi,
     dose_grid: &DoseGrid,
     options: &MarginOptions,
 ) -> Result<MarginResult, DvhError> {
+    ensure_dose_path_direction_supported(options.direction)?;
+
     // Calculate LUTs from dose grid
     let (col_lut, row_lut) = calculate_luts(dose_grid);
 
@@ -1049,6 +1077,121 @@ fn build_combined_mask(
             }
             Ok(combined)
         }
+        ContourCombineMode::NestingAware => Ok(combine_nesting_aware(
+            contours, col_lut, row_lut, x_lut_index,
+        )),
+    }
+}
+
+/// Compose contours on a plane, classifying each as a solid region or a hole.
+///
+/// Neither pure union nor pure even-odd is correct for RTSTRUCT planes: union
+/// fills genuine holes (nested inner contours), while even-odd cancels the
+/// overlapping or duplicate "solid" contours that `merge_matching_rois` can
+/// produce from duplicate-named ROIs. This:
+///   1. drops exact-duplicate contours (a merge artifact that would otherwise
+///      classify as mutually-nested holes and vanish);
+///   2. classifies each remaining contour by how many *other* contours fully
+///      contain it (even depth = solid, odd depth = hole);
+///   3. returns `(union of solids) AND NOT (union of holes)`.
+///
+/// Limitation: a solid island nested inside a hole (containment depth >= 2) is
+/// treated as part of the hole. Such depth-2 nesting is not present in the
+/// RTSTRUCT data targeted here and is left for a future enhancement.
+fn combine_nesting_aware(
+    contours: &[Contour],
+    col_lut: &[f64],
+    row_lut: &[f64],
+    x_lut_index: u8,
+) -> Array2<bool> {
+    let rows = row_lut.len();
+    let cols = col_lut.len();
+    let mut inside = Array2::from_elem((rows, cols), false);
+
+    let deduped = dedupe_contours(contours);
+    if deduped.is_empty() {
+        return inside;
+    }
+
+    let masks: Vec<Array2<bool>> = deduped
+        .iter()
+        .map(|c| MatplotlibPolygon::create_mask(&c.points, col_lut, row_lut, x_lut_index))
+        .collect();
+
+    let mut solids = Array2::from_elem((rows, cols), false);
+    let mut holes = Array2::from_elem((rows, cols), false);
+    for (i, mask_i) in masks.iter().enumerate() {
+        let depth = masks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .filter(|(_, mask_j)| mask_subset(mask_i, mask_j))
+            .count();
+        let target = if depth % 2 == 0 { &mut solids } else { &mut holes };
+        or_into(target, mask_i);
+    }
+
+    for r in 0..rows {
+        for c in 0..cols {
+            inside[[r, c]] = solids[[r, c]] && !holes[[r, c]];
+        }
+    }
+    inside
+}
+
+/// Remove exact-duplicate contours (identical point sequences within a tight
+/// tolerance). Such duplicates arise when `merge_matching_rois` concatenates
+/// contours from duplicate-named ROIs; under nesting classification they would
+/// otherwise mutually contain each other and both register as holes.
+fn dedupe_contours(contours: &[Contour]) -> Vec<Contour> {
+    let mut out: Vec<Contour> = Vec::with_capacity(contours.len());
+    for c in contours {
+        if out
+            .iter()
+            .any(|kept| contours_approx_equal(&kept.points, &c.points))
+        {
+            continue;
+        }
+        out.push(c.clone());
+    }
+    out
+}
+
+/// Two contours are duplicates when they have the same vertex count and every
+/// corresponding vertex matches within a tight tolerance.
+fn contours_approx_equal(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    const EPS: f64 = 1e-6;
+    a.iter()
+        .zip(b.iter())
+        .all(|(p, q)| (p[0] - q[0]).abs() < EPS && (p[1] - q[1]).abs() < EPS)
+}
+
+/// True when (nearly) every set voxel of `inner` is also set in `outer`, i.e.
+/// `inner` is contained in `outer`. A small slack absorbs boundary aliasing.
+fn mask_subset(inner: &Array2<bool>, outer: &Array2<bool>) -> bool {
+    let inner_count = inner.iter().filter(|&&v| v).count();
+    if inner_count == 0 {
+        return false;
+    }
+    let mut outside = 0usize;
+    for ((r, c), &v) in inner.indexed_iter() {
+        if v && !outer[[r, c]] {
+            outside += 1;
+        }
+    }
+    let slack = (inner_count / 50).max(1);
+    outside <= slack
+}
+
+/// OR `src` into `target` in place.
+fn or_into(target: &mut Array2<bool>, src: &Array2<bool>) {
+    for ((r, c), &v) in src.indexed_iter() {
+        if v {
+            target[[r, c]] = true;
+        }
     }
 }
 
@@ -1142,6 +1285,105 @@ mod tests {
         // Point (3,3) is in overlap region and should survive union composition.
         assert!(union_mask[[3, 3]]);
         assert!(!xor_mask[[3, 3]]);
+    }
+
+    #[test]
+    fn test_nesting_aware_preserves_holes() {
+        // Outer 0..10 square with a nested inner 3..7 hole on the same plane.
+        let outer = Contour {
+            points: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            contour_type: ContourType::External,
+        };
+        let hole = Contour {
+            points: vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+            contour_type: ContourType::External,
+        };
+        let contours = vec![outer, hole];
+        let col_lut: Vec<f64> = (0..=10).map(|v| v as f64).collect();
+        let row_lut: Vec<f64> = (0..=10).map(|v| v as f64).collect();
+
+        let mask = build_combined_mask(
+            &contours,
+            &col_lut,
+            &row_lut,
+            0,
+            ContourCombineMode::NestingAware,
+        )
+        .unwrap();
+        // Solid ring is inside; the hole centre is excluded.
+        assert!(mask[[1, 1]]);
+        assert!(!mask[[5, 5]]);
+
+        // Union would (incorrectly) fill the hole — this is the bug being fixed.
+        let union = build_combined_mask(
+            &contours,
+            &col_lut,
+            &row_lut,
+            0,
+            ContourCombineMode::Union,
+        )
+        .unwrap();
+        assert!(union[[5, 5]]);
+    }
+
+    #[test]
+    fn test_nesting_aware_keeps_overlapping_solids() {
+        // Two partially overlapping solids (merged duplicate ROI) must keep
+        // their overlap; even-odd would cancel it.
+        let a = Contour {
+            points: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [0.0, 6.0]],
+            contour_type: ContourType::External,
+        };
+        let b = Contour {
+            points: vec![[2.0, 0.0], [8.0, 0.0], [8.0, 6.0], [2.0, 6.0]],
+            contour_type: ContourType::External,
+        };
+        let contours = vec![a, b];
+        let col_lut: Vec<f64> = (0..=8).map(|v| v as f64).collect();
+        let row_lut: Vec<f64> = (0..=6).map(|v| v as f64).collect();
+
+        let mask = build_combined_mask(
+            &contours,
+            &col_lut,
+            &row_lut,
+            0,
+            ContourCombineMode::NestingAware,
+        )
+        .unwrap();
+        assert!(mask[[3, 3]]);
+    }
+
+    #[test]
+    fn test_nesting_aware_dedupes_exact_duplicates() {
+        // Identical contours (duplicate-name ROI merge artifact) must not
+        // cancel to empty under nesting classification.
+        let sq = Contour {
+            points: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [0.0, 6.0]],
+            contour_type: ContourType::External,
+        };
+        let contours = vec![sq.clone(), sq];
+        let col_lut: Vec<f64> = (0..=6).map(|v| v as f64).collect();
+        let row_lut: Vec<f64> = (0..=6).map(|v| v as f64).collect();
+
+        let mask = build_combined_mask(
+            &contours,
+            &col_lut,
+            &row_lut,
+            0,
+            ContourCombineMode::NestingAware,
+        )
+        .unwrap();
+        assert!(mask[[3, 3]]);
+    }
+
+    #[test]
+    fn test_dose_path_rejects_lateral_direction() {
+        // The RTDOSE path must reject Lateral rather than silently returning a
+        // uniform margin.
+        assert!(ensure_dose_path_direction_supported(Some(MarginDirection::Lateral)).is_err());
+        assert!(ensure_dose_path_direction_supported(Some(MarginDirection::Posterior)).is_ok());
+        assert!(ensure_dose_path_direction_supported(Some(MarginDirection::Uniform)).is_ok());
+        assert!(ensure_dose_path_direction_supported(None).is_ok());
     }
 
     #[test]
