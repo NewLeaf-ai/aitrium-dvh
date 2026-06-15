@@ -834,7 +834,7 @@ fn compute_margin(
                 &col_lut,
                 &row_lut,
                 dose_grid.x_lut_index,
-                ContourCombineMode::XorEvenOdd,
+                ContourCombineMode::NestingAware,
             )?;
             let center_2d = calculate_center_of_mass_2d(&mask_b, &col_lut, &row_lut, z_pos.0);
 
@@ -874,14 +874,14 @@ fn compute_margin(
             &col_lut,
             &row_lut,
             dose_grid.x_lut_index,
-            ContourCombineMode::XorEvenOdd,
+            ContourCombineMode::NestingAware,
         )?;
         let mask_b = build_combined_mask(
             contours_b,
             &col_lut,
             &row_lut,
             dose_grid.x_lut_index,
-            ContourCombineMode::XorEvenOdd,
+            ContourCombineMode::NestingAware,
         )?;
 
         // Compute signed distance field for B
@@ -1128,10 +1128,31 @@ fn combine_nesting_aware(
         .map(|c| MatplotlibPolygon::create_mask(&c.points, col_lut, row_lut, x_lut_index))
         .collect();
 
+    // Collapse contours that rasterize to the same region (duplicates in any
+    // vertex encoding) to a single representative, so duplicate containers count
+    // as ONE nesting layer instead of inflating depth (two equivalent outers
+    // around a cavity would otherwise make the hole depth 2 = solid, refilling
+    // the cavity).
+    let mut reps: Vec<Array2<bool>> = Vec::new();
+    for mask in &masks {
+        if mask.iter().all(|&v| !v) {
+            continue; // skip degenerate / empty contours
+        }
+        if reps
+            .iter()
+            .any(|rep| mask_subset(mask, rep) && mask_subset(rep, mask))
+        {
+            continue;
+        }
+        reps.push(mask.clone());
+    }
+
     let mut solids = Array2::from_elem((rows, cols), false);
     let mut holes = Array2::from_elem((rows, cols), false);
-    for (i, mask_i) in masks.iter().enumerate() {
-        let depth = masks
+    for (i, mask_i) in reps.iter().enumerate() {
+        // Count UNIQUE containment layers: representatives that strictly contain
+        // this one (subset one-way). Even depth = solid region, odd = hole.
+        let depth = reps
             .iter()
             .enumerate()
             .filter(|(j, _)| *j != i)
@@ -1304,6 +1325,35 @@ mod tests {
         )
         .unwrap();
         assert!(union[[5, 5]]);
+    }
+
+    #[test]
+    fn test_nesting_aware_hole_with_duplicate_outers() {
+        // A real cavity contained by TWO duplicate outer contours (duplicate-
+        // name ROI merge) must stay a hole — depth counts unique layers, not
+        // duplicate containers.
+        let outer = Contour {
+            points: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            contour_type: ContourType::External,
+        };
+        let hole = Contour {
+            points: vec![[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]],
+            contour_type: ContourType::External,
+        };
+        let contours = vec![outer.clone(), outer, hole];
+        let col_lut: Vec<f64> = (0..=10).map(|v| v as f64).collect();
+        let row_lut: Vec<f64> = (0..=10).map(|v| v as f64).collect();
+
+        let mask = build_combined_mask(
+            &contours,
+            &col_lut,
+            &row_lut,
+            0,
+            ContourCombineMode::NestingAware,
+        )
+        .unwrap();
+        assert!(mask[[1, 1]]); // solid ring present
+        assert!(!mask[[5, 5]]); // cavity preserved despite duplicate outers
     }
 
     #[test]
