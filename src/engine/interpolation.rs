@@ -11,17 +11,14 @@ pub fn rescale_2d(input: ArrayView2<f32>, scale_row: f64, scale_col: f64) -> Arr
 
     for out_r in 0..out_rows {
         for out_c in 0..out_cols {
-            // Map output coordinates with corner alignment so boundary values are preserved.
-            let in_r = if out_rows > 1 {
-                out_r as f64 * (in_rows.saturating_sub(1)) as f64 / (out_rows - 1) as f64
-            } else {
-                0.0
-            };
-            let in_c = if out_cols > 1 {
-                out_c as f64 * (in_cols.saturating_sub(1)) as f64 / (out_cols - 1) as f64
-            } else {
-                0.0
-            };
+            // Map output coordinate to input coordinate at the requested
+            // spacing (in = out / scale), matching scikit-image rescale and the
+            // physical resolution callers request via scale_row/scale_col. (The
+            // earlier corner-aligned mapping distorted the sampling interval and
+            // misregistered interpolated dose vs. target-resolution coords —
+            // AIT-748.)
+            let in_r = out_r as f64 / scale_row;
+            let in_c = out_c as f64 / scale_col;
 
             // Get the four surrounding pixels
             let r0 = in_r.floor() as isize;
@@ -146,14 +143,16 @@ mod tests {
         // Should interpolate to 4x4
         assert_eq!(output.dim(), (4, 4));
 
-        // Corner values should be preserved
+        // Corner values are preserved (edge clamping) under out/scale mapping.
         assert_eq!(output[[0, 0]], 1.0);
         assert_eq!(output[[0, 3]], 2.0);
         assert_eq!(output[[3, 0]], 3.0);
         assert_eq!(output[[3, 3]], 4.0);
 
-        // Check some interpolated values
-        assert!((output[[1, 1]] - 2.0).abs() < 0.1);
+        // Interior sample is the true bilinear center of [1,2,3,4] = 2.5.
+        // (The prior 2.0 expectation encoded the corner-aligned mapping that
+        // distorted physical spacing — see AIT-748.)
+        assert!((output[[1, 1]] - 2.5).abs() < 0.1);
     }
 
     #[test]
