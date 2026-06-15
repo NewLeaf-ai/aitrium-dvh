@@ -115,6 +115,8 @@ pub struct DvhStats {
 pub enum MarginDirection {
     /// Margin in all directions (default)
     Uniform,
+    /// Conservative lateral margin: min(left, right)
+    Lateral,
     /// Posterior direction (toward back)
     Posterior,
     /// Anterior direction (toward front)
@@ -247,6 +249,10 @@ impl Ord for OrderedFloat {
     }
 }
 
+// PartialOrd must delegate to Ord so the wrapper stays totally ordered and
+// consistent with its BTreeMap key usage. Deriving PartialOrd (delegating to
+// f64) would return None for non-finite values, disagreeing with Ord and
+// risking panics in generic `partial_cmp(...).unwrap()` callers.
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

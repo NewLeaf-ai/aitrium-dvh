@@ -6,7 +6,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Compute DVH metrics for explicit ROI numbers")]
+#[command(
+    author,
+    version,
+    about = "Compute DVH metrics for explicit ROI numbers"
+)]
 struct Args {
     /// RTSTRUCT DICOM path
     #[arg(long)]
@@ -50,7 +54,11 @@ struct DvhMetricsOutput {
     rois: Vec<RoiMetricOutput>,
 }
 
-fn volume_percent_at_dose_gy(differential_hist_cgy: &[f64], total_volume_cc: f64, dose_gy: f64) -> f64 {
+fn volume_percent_at_dose_gy(
+    differential_hist_cgy: &[f64],
+    total_volume_cc: f64,
+    dose_gy: f64,
+) -> f64 {
     if differential_hist_cgy.is_empty() || total_volume_cc <= 0.0 {
         return 0.0;
     }
