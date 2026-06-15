@@ -678,13 +678,14 @@ fn local_outward_normal(
 
 fn direction_to_lps_vector(direction: MarginDirection) -> Option<[f64; 3]> {
     match direction {
+        // Uniform/Lateral have no single axis and are handled specially by the
+        // v2 caller. Every other direction uses the SHARED, patient-aware
+        // convention (direction_to_vector) so the RTSTRUCT-only path agrees with
+        // compute_margin_directed instead of inverting Posterior/Anterior. The
+        // v2 path has no patient-position source, so it assumes HFS — the same
+        // default direction_to_vector uses.
         MarginDirection::Uniform | MarginDirection::Lateral => None,
-        MarginDirection::Left => Some([1.0, 0.0, 0.0]),
-        MarginDirection::Right => Some([-1.0, 0.0, 0.0]),
-        MarginDirection::Posterior => Some([0.0, 1.0, 0.0]),
-        MarginDirection::Anterior => Some([0.0, -1.0, 0.0]),
-        MarginDirection::Superior => Some([0.0, 0.0, 1.0]),
-        MarginDirection::Inferior => Some([0.0, 0.0, -1.0]),
+        other => Some(direction_to_vector(other, None)),
     }
 }
 
@@ -1192,7 +1193,12 @@ fn mask_subset(inner: &Array2<bool>, outer: &Array2<bool>) -> bool {
             outside += 1;
         }
     }
-    let slack = (inner_count / 50).max(1);
+    // No minimum slack: a single out-of-outer voxel is a real difference, not
+    // aliasing, so 1-voxel / tiny masks require exact containment (else any
+    // one-voxel island would be falsely treated as contained → dropped or
+    // misclassified as a hole). Allow ~2% only on larger masks for boundary
+    // aliasing.
+    let slack = inner_count / 50;
     outside <= slack
 }
 
@@ -1577,14 +1583,14 @@ mod tests {
             &[-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0],
             2.0,
         );
-        // Posterior margin is 3mm (outer +13 vs inner +10), anterior is 7mm
-        // (outer -17 vs inner -10).
+        // Shared convention: HFS posterior = -Y. Posterior gap is 3mm (inner
+        // -10 vs outer -13); anterior (+Y) gap is 7mm (inner 10 vs outer 17).
         let outer = make_rect_roi(
             "PTV",
             -15.0,
             15.0,
-            -17.0,
-            13.0,
+            -13.0,
+            17.0,
             &[-8.0, -6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0],
             2.0,
         );
