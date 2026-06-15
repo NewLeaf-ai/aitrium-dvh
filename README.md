@@ -289,9 +289,10 @@ use aitrium_dvh::{DvhOptions, compute_dvh};
 let options = DvhOptions {
     calculate_full_volume: false,
     use_structure_extents: false,
-    interpolation_resolution: None,  // Not yet implemented
+    interpolation_resolution_mm: None,
     interpolation_segments_between_planes: 0,
     limit_cgy: None,
+    ..DvhOptions::default()
 };
 
 let result = compute_dvh(

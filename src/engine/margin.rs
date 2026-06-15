@@ -368,6 +368,12 @@ fn collect_directional_clearances(
         if !signed_distance.is_finite() {
             continue;
         }
+        // KNOWN LIMITATION (AIT-746): the binary-mask EDT measures center-to-
+        // center distance, so an inside boundary voxel reads ~1 voxel from the
+        // boundary. Coincident/touching ROIs therefore over-report clearance by
+        // ~one voxel spacing (non-conservative). A sub-voxel / zero-level-offset
+        // fix with analytic validation is tracked separately before B1b relies
+        // on these margin facts.
         clearances.push(-signed_distance);
     }
 
