@@ -949,21 +949,26 @@ fn compute_margin(
         });
     }
 
-    // Drop non-finite samples before computing summary statistics.
-    let mut non_finite_samples = 0usize;
+    // Conservative handling (AIT-746): a +INF distance means a source voxel has
+    // NO target coverage on its slice (the target rasterized empty there) — a
+    // worst-case miss. Dropping these would compute the margin only from slices
+    // where the target happened to rasterize and look falsely acceptable, so we
+    // KEEP +INF (it correctly drops coverage% and drives mean/upper percentiles
+    // to +INF). Drop only NaN, which is genuinely invalid.
+    let mut nan_samples = 0usize;
     distance_samples.retain(|(d, _)| {
-        if d.is_finite() {
-            true
-        } else {
-            non_finite_samples += 1;
+        if d.is_nan() {
+            nan_samples += 1;
             false
+        } else {
+            true
         }
     });
 
-    if non_finite_samples > 0 {
+    if nan_samples > 0 {
         eprintln!(
-            "Dropped {} non-finite margin samples for {} -> {}",
-            non_finite_samples, roi_a.name, roi_b.name
+            "Dropped {} NaN margin samples for {} -> {}",
+            nan_samples, roi_a.name, roi_b.name
         );
     }
 
