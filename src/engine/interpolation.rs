@@ -11,9 +11,17 @@ pub fn rescale_2d(input: ArrayView2<f32>, scale_row: f64, scale_col: f64) -> Arr
 
     for out_r in 0..out_rows {
         for out_c in 0..out_cols {
-            // Map output coordinate to input coordinate
-            let in_r = out_r as f64 / scale_row;
-            let in_c = out_c as f64 / scale_col;
+            // Map output coordinates with corner alignment so boundary values are preserved.
+            let in_r = if out_rows > 1 {
+                out_r as f64 * (in_rows.saturating_sub(1)) as f64 / (out_rows - 1) as f64
+            } else {
+                0.0
+            };
+            let in_c = if out_cols > 1 {
+                out_c as f64 * (in_cols.saturating_sub(1)) as f64 / (out_cols - 1) as f64
+            } else {
+                0.0
+            };
 
             // Get the four surrounding pixels
             let r0 = in_r.floor() as isize;

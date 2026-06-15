@@ -5,7 +5,7 @@
 /// the number of pixels.
 ///
 /// Reference: Felzenszwalb & Huttenlocher (2012), "Distance Transforms of Sampled Functions"
-use ndarray::Array2;
+use ndarray::{Array2, Array3};
 
 /// Compute 2D Euclidean Distance Transform
 ///
@@ -55,6 +55,61 @@ pub fn euclidean_distance_transform(mask: &Array2<bool>, dx_mm: f64, dy_mm: f64)
     distance_sq.mapv(|x| x.sqrt())
 }
 
+/// Compute 3D Euclidean Distance Transform
+///
+/// Returns the distance (in mm) from each voxel to the nearest feature voxel (True value).
+/// Handles anisotropic voxel spacing (different dx/dy/dz).
+pub fn euclidean_distance_transform_3d(
+    mask: &Array3<bool>,
+    dx_mm: f64,
+    dy_mm: f64,
+    dz_mm: f64,
+) -> Array3<f64> {
+    let (depth, height, width) = mask.dim();
+
+    let mut distance_sq = Array3::from_elem((depth, height, width), f64::INFINITY);
+    for ((k, i, j), &is_feature) in mask.indexed_iter() {
+        if is_feature {
+            distance_sq[[k, i, j]] = 0.0;
+        }
+    }
+
+    // Pass 1: X axis (columns)
+    for k in 0..depth {
+        for i in 0..height {
+            let mut line: Vec<f64> = (0..width).map(|j| distance_sq[[k, i, j]]).collect();
+            edt_1d_pass(&mut line, dx_mm);
+            for (j, &val) in line.iter().enumerate() {
+                distance_sq[[k, i, j]] = val;
+            }
+        }
+    }
+
+    // Pass 2: Y axis (rows)
+    for k in 0..depth {
+        for j in 0..width {
+            let mut line: Vec<f64> = (0..height).map(|i| distance_sq[[k, i, j]]).collect();
+            edt_1d_pass(&mut line, dy_mm);
+            for (i, &val) in line.iter().enumerate() {
+                distance_sq[[k, i, j]] = val;
+            }
+        }
+    }
+
+    // Pass 3: Z axis (frames)
+    for i in 0..height {
+        for j in 0..width {
+            let mut line: Vec<f64> = (0..depth).map(|k| distance_sq[[k, i, j]]).collect();
+            edt_1d_pass(&mut line, dz_mm);
+            for (k, &val) in line.iter().enumerate() {
+                distance_sq[[k, i, j]] = val;
+            }
+        }
+    }
+
+    distance_sq.mapv(|x| x.sqrt())
+}
+
 /// 1D Euclidean Distance Transform using parabola envelope method
 ///
 /// This processes a single row or column of squared distances.
@@ -69,82 +124,83 @@ fn edt_1d_pass(distances: &mut [f64], spacing_mm: f64) {
         return;
     }
 
-    // Convert to squared distances with spacing
-    let f: Vec<f64> = distances
-        .iter()
-        .enumerate()
-        .map(|(i, &d)| d + (i as f64 * spacing_mm).powi(2))
-        .collect();
+    // Squared distance input (0 for features, +inf for non-features in pass 1).
+    let f = distances.to_vec();
 
-    // Parabola envelope algorithm
-    let mut v = vec![0usize]; // Indices of parabolas in lower envelope
-    let mut z = vec![f64::NEG_INFINITY, f64::INFINITY]; // Intersection x-coordinates
+    // No finite sites in this 1D line => remain +inf.
+    let Some(first_finite_idx) = f.iter().position(|d| d.is_finite()) else {
+        return;
+    };
 
-    // Build lower envelope
-    for q in 1..n {
-        let mut k = v.len();
+    // Felzenszwalb & Huttenlocher lower-envelope construction.
+    let mut v = vec![0usize; n];
+    let mut z = vec![0.0f64; n + 1];
+    let mut k = 0usize;
 
-        // Remove parabolas that are no longer in the lower envelope
+    v[0] = first_finite_idx;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+
+    for q in (first_finite_idx + 1)..n {
+        if !f[q].is_finite() {
+            continue;
+        }
+
+        let q_pos = q as f64 * spacing_mm;
+        let mut s;
+
         loop {
-            let i = v[k - 1];
+            let i = v[k];
+            let i_pos = i as f64 * spacing_mm;
+            let numerator = (f[q] + q_pos * q_pos) - (f[i] + i_pos * i_pos);
+            let denominator = 2.0 * (q_pos - i_pos);
 
-            // Calculate intersection of parabola at i and parabola at q
-            let numerator =
-                (f[q] + (q as f64 * spacing_mm).powi(2)) - (f[i] + (i as f64 * spacing_mm).powi(2));
-            let denominator = 2.0 * spacing_mm * (q as f64 - i as f64);
-
-            let s = if denominator.abs() > 1e-10 {
+            s = if denominator.abs() > 1e-12 {
                 numerator / denominator
             } else {
                 f64::INFINITY
             };
 
-            if s <= z[k - 1] {
-                // Parabola i is dominated, remove it
-                k -= 1;
-                v.pop();
-                z.pop();
-
-                if k == 1 {
+            if s <= z[k] {
+                if k == 0 {
                     break;
                 }
+                k -= 1;
             } else {
                 break;
             }
         }
 
-        // Add new parabola to envelope
-        v.push(q);
+        // q does not improve envelope for any x.
+        if s <= z[k] {
+            continue;
+        }
 
-        // Calculate intersection with previous parabola
-        let prev_idx = v[v.len() - 2];
-        let numerator = (f[q] + (q as f64 * spacing_mm).powi(2))
-            - (f[prev_idx] + (prev_idx as f64 * spacing_mm).powi(2));
-        let denominator = 2.0 * spacing_mm * (q as f64 - prev_idx as f64);
-
-        let intersection = if denominator.abs() > 1e-10 {
-            numerator / denominator
-        } else {
-            f64::INFINITY
-        };
-
-        z.push(intersection);
-        z.push(f64::INFINITY);
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
     }
 
-    // Fill distances from lower envelope
-    let mut k = 0;
-    for q in 0..n {
+    // Evaluate lower envelope at each sample position.
+    k = 0;
+    for (q, out) in distances.iter_mut().enumerate() {
         let q_pos = q as f64 * spacing_mm;
-
-        // Find which parabola q belongs to
         while z[k + 1] < q_pos {
             k += 1;
         }
 
         let i = v[k];
-        let dist_sq = (q as f64 - i as f64).powi(2) * spacing_mm.powi(2) + f[i];
-        distances[q] = dist_sq;
+        let i_pos = i as f64 * spacing_mm;
+        let delta = q_pos - i_pos;
+        *out = delta * delta + f[i];
+    }
+
+    // Numerical guard for tiny negative values from floating-point roundoff.
+    for d in distances.iter_mut() {
+        if *d < 0.0 && (*d).abs() < 1e-12 {
+            *d = 0.0;
+        }
     }
 }
 
@@ -163,26 +219,52 @@ fn edt_1d_pass(distances: &mut [f64], spacing_mm: f64) {
 /// # Returns
 /// Signed distance field in mm
 pub fn signed_distance_field(mask: &Array2<bool>, dx_mm: f64, dy_mm: f64) -> Array2<f64> {
-    // Compute EDT for interior (distance from inside to boundary)
-    let edt_interior = euclidean_distance_transform(mask, dx_mm, dy_mm);
+    // Distance to nearest inside voxel (0 inside, positive outside)
+    let edt_to_inside = euclidean_distance_transform(mask, dx_mm, dy_mm);
 
-    // Compute EDT for exterior (distance from outside to boundary)
+    // Distance to nearest outside voxel (0 outside, positive inside)
     let mask_inverted = mask.mapv(|x| !x);
-    let edt_exterior = euclidean_distance_transform(&mask_inverted, dx_mm, dy_mm);
+    let edt_to_outside = euclidean_distance_transform(&mask_inverted, dx_mm, dy_mm);
 
     // Combine into signed distance field
     let mut sdf = Array2::zeros(mask.dim());
 
     for ((i, j), &is_inside) in mask.indexed_iter() {
         if is_inside {
-            // Inside: negative distance
-            sdf[[i, j]] = -edt_interior[[i, j]];
+            // Inside: negative distance to boundary
+            sdf[[i, j]] = -edt_to_outside[[i, j]];
         } else {
-            // Outside: positive distance
-            sdf[[i, j]] = edt_exterior[[i, j]];
+            // Outside: positive distance to boundary
+            sdf[[i, j]] = edt_to_inside[[i, j]];
         }
     }
 
+    sdf
+}
+
+/// Compute signed distance field for a 3D binary mask.
+///
+/// Convention:
+/// - inside voxels: negative distance to nearest outside voxel
+/// - outside voxels: positive distance to nearest inside voxel
+pub fn signed_distance_field_3d(
+    mask: &Array3<bool>,
+    dx_mm: f64,
+    dy_mm: f64,
+    dz_mm: f64,
+) -> Array3<f64> {
+    let edt_to_inside = euclidean_distance_transform_3d(mask, dx_mm, dy_mm, dz_mm);
+    let mask_inverted = mask.mapv(|x| !x);
+    let edt_to_outside = euclidean_distance_transform_3d(&mask_inverted, dx_mm, dy_mm, dz_mm);
+
+    let mut sdf = Array3::zeros(mask.dim());
+    for ((k, i, j), &is_inside) in mask.indexed_iter() {
+        if is_inside {
+            sdf[[k, i, j]] = -edt_to_outside[[k, i, j]];
+        } else {
+            sdf[[k, i, j]] = edt_to_inside[[k, i, j]];
+        }
+    }
     sdf
 }
 
@@ -190,6 +272,7 @@ pub fn signed_distance_field(mask: &Array2<bool>, dx_mm: f64, dy_mm: f64) -> Arr
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use ndarray::Array3;
 
     #[test]
     fn test_edt_single_pixel() {
@@ -298,5 +381,73 @@ mod tests {
         assert_relative_eq!(sdf[[3, 5]].abs(), corner_dist, epsilon = 0.1);
         assert_relative_eq!(sdf[[5, 3]].abs(), corner_dist, epsilon = 0.1);
         assert_relative_eq!(sdf[[5, 5]].abs(), corner_dist, epsilon = 0.1);
+    }
+
+    #[test]
+    fn test_edt_all_true_is_zero() {
+        let mask = Array2::from_elem((5, 7), true);
+        let edt = euclidean_distance_transform(&mask, 1.0, 1.0);
+        assert!(edt.iter().all(|d| d.is_finite() && *d == 0.0));
+    }
+
+    #[test]
+    fn test_edt_all_false_is_infinite() {
+        let mask = Array2::from_elem((5, 7), false);
+        let edt = euclidean_distance_transform(&mask, 1.0, 1.0);
+        assert!(edt.iter().all(|d| d.is_infinite() && d.is_sign_positive()));
+    }
+
+    #[test]
+    fn test_sdf_is_finite_for_mixed_mask() {
+        let mut mask = Array2::from_elem((9, 9), false);
+        for i in 2..7 {
+            for j in 2..7 {
+                mask[[i, j]] = true;
+            }
+        }
+
+        let sdf = signed_distance_field(&mask, 1.0, 1.0);
+        assert!(sdf.iter().all(|d| d.is_finite()));
+    }
+
+    #[test]
+    fn test_sdf_all_true_is_negative_infinite() {
+        let mask = Array2::from_elem((5, 7), true);
+        let sdf = signed_distance_field(&mask, 1.0, 1.0);
+        assert!(sdf.iter().all(|d| d.is_infinite() && d.is_sign_negative()));
+    }
+
+    #[test]
+    fn test_sdf_all_false_is_positive_infinite() {
+        let mask = Array2::from_elem((5, 7), false);
+        let sdf = signed_distance_field(&mask, 1.0, 1.0);
+        assert!(sdf.iter().all(|d| d.is_infinite() && d.is_sign_positive()));
+    }
+
+    #[test]
+    fn test_edt_3d_simple() {
+        let mut mask = Array3::from_elem((5, 5, 5), false);
+        mask[[2, 2, 2]] = true;
+        let edt = euclidean_distance_transform_3d(&mask, 1.0, 1.0, 1.0);
+        assert_relative_eq!(edt[[2, 2, 2]], 0.0, epsilon = 0.01);
+        assert_relative_eq!(edt[[2, 2, 3]], 1.0, epsilon = 0.01);
+        assert_relative_eq!(edt[[2, 3, 2]], 1.0, epsilon = 0.01);
+        assert_relative_eq!(edt[[3, 2, 2]], 1.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_sdf_3d_mixed_signs() {
+        let mut mask = Array3::from_elem((7, 7, 7), false);
+        for k in 2..5 {
+            for i in 2..5 {
+                for j in 2..5 {
+                    mask[[k, i, j]] = true;
+                }
+            }
+        }
+        let sdf = signed_distance_field_3d(&mask, 1.0, 1.0, 1.0);
+        assert!(sdf[[3, 3, 3]] < 0.0);
+        assert!(sdf[[0, 0, 0]] > 0.0);
+        assert!(sdf.iter().all(|d| d.is_finite()));
     }
 }

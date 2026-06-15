@@ -60,6 +60,10 @@ pub fn direction_to_vector(
             // No specific direction - this shouldn't be called for uniform margins
             [0.0, 0.0, 0.0]
         }
+        MarginDirection::Lateral => {
+            // V1 path does not support bilateral aggregation at this level.
+            [0.0, 0.0, 0.0]
+        }
         MarginDirection::Posterior => match pos {
             PatientPosition::HFS | PatientPosition::FFS => [0.0, -1.0, 0.0],
             PatientPosition::HFP | PatientPosition::FFP => [0.0, 1.0, 0.0],

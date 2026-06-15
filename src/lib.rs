@@ -6,8 +6,11 @@ pub mod types;
 pub use dicom_parser::{parse_rtdose, parse_rtstruct};
 pub use engine::dvh::{compute_all_dvhs, compute_dvh};
 pub use engine::{
-    compute_margin_directed, compute_overlap_by_name, euclidean_distance_transform,
-    signed_distance_field, DvhEngine, MarginOptions, MarginResult, OverlapOptions, OverlapResult,
+    compute_margin_directed, compute_margin_directed_rtstruct,
+    compute_margin_directed_rtstruct_on_rois, compute_overlap_by_name,
+    euclidean_distance_transform, euclidean_distance_transform_3d, signed_distance_field,
+    signed_distance_field_3d, DvhEngine, MarginOptions, MarginResult, OverlapOptions,
+    OverlapResult,
 };
 pub use types::{
     BatchOutput, DvhError, DvhOptions, DvhResult, DvhStats, MarginDirection, RoiDvhJson,

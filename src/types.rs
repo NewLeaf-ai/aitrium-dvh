@@ -115,6 +115,8 @@ pub struct DvhStats {
 pub enum MarginDirection {
     /// Margin in all directions (default)
     Uniform,
+    /// Conservative lateral margin: min(left, right)
+    Lateral,
     /// Posterior direction (toward back)
     Posterior,
     /// Anterior direction (toward front)
@@ -234,7 +236,7 @@ impl DoseBacking {
 }
 
 /// Wrapper for ordered floats (for BTreeMap keys)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct OrderedFloat(pub f64);
 
 impl Eq for OrderedFloat {}
@@ -244,12 +246,6 @@ impl Ord for OrderedFloat {
         self.0
             .partial_cmp(&other.0)
             .unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
