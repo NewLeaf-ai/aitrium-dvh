@@ -1089,11 +1089,16 @@ fn build_combined_mask(
 /// fills genuine holes (nested inner contours), while even-odd cancels the
 /// overlapping or duplicate "solid" contours that `merge_matching_rois` can
 /// produce from duplicate-named ROIs. This:
-///   1. drops exact-duplicate contours (a merge artifact that would otherwise
-///      classify as mutually-nested holes and vanish);
-///   2. classifies each remaining contour by how many *other* contours fully
-///      contain it (even depth = solid, odd depth = hole);
-///   3. returns `(union of solids) AND NOT (union of holes)`.
+///   1. classifies each contour by how many *other* contours STRICTLY contain
+///      it — `mask_i ⊆ mask_j` but not the reverse (even depth = solid, odd =
+///      hole);
+///   2. returns `(union of solids) AND NOT (union of holes)`.
+///
+/// Strict containment is the key: two contours that mutually contain each other
+/// are the *same* region — duplicates in any vertex encoding (reordered,
+/// reversed winding, repeated closing point) rasterize to equal masks — so they
+/// add no nesting depth and remain solid rather than both registering as holes
+/// and cancelling.
 ///
 /// Limitation: a solid island nested inside a hole (containment depth >= 2) is
 /// treated as part of the hole. Such depth-2 nesting is not present in the
@@ -1108,12 +1113,11 @@ fn combine_nesting_aware(
     let cols = col_lut.len();
     let mut inside = Array2::from_elem((rows, cols), false);
 
-    let deduped = dedupe_contours(contours);
-    if deduped.is_empty() {
+    if contours.is_empty() {
         return inside;
     }
 
-    let masks: Vec<Array2<bool>> = deduped
+    let masks: Vec<Array2<bool>> = contours
         .iter()
         .map(|c| MatplotlibPolygon::create_mask(&c.points, col_lut, row_lut, x_lut_index))
         .collect();
@@ -1125,7 +1129,7 @@ fn combine_nesting_aware(
             .iter()
             .enumerate()
             .filter(|(j, _)| *j != i)
-            .filter(|(_, mask_j)| mask_subset(mask_i, mask_j))
+            .filter(|(_, mask_j)| mask_subset(mask_i, mask_j) && !mask_subset(mask_j, mask_i))
             .count();
         let target = if depth % 2 == 0 { &mut solids } else { &mut holes };
         or_into(target, mask_i);
@@ -1137,36 +1141,6 @@ fn combine_nesting_aware(
         }
     }
     inside
-}
-
-/// Remove exact-duplicate contours (identical point sequences within a tight
-/// tolerance). Such duplicates arise when `merge_matching_rois` concatenates
-/// contours from duplicate-named ROIs; under nesting classification they would
-/// otherwise mutually contain each other and both register as holes.
-fn dedupe_contours(contours: &[Contour]) -> Vec<Contour> {
-    let mut out: Vec<Contour> = Vec::with_capacity(contours.len());
-    for c in contours {
-        if out
-            .iter()
-            .any(|kept| contours_approx_equal(&kept.points, &c.points))
-        {
-            continue;
-        }
-        out.push(c.clone());
-    }
-    out
-}
-
-/// Two contours are duplicates when they have the same vertex count and every
-/// corresponding vertex matches within a tight tolerance.
-fn contours_approx_equal(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    const EPS: f64 = 1e-6;
-    a.iter()
-        .zip(b.iter())
-        .all(|(p, q)| (p[0] - q[0]).abs() < EPS && (p[1] - q[1]).abs() < EPS)
 }
 
 /// True when (nearly) every set voxel of `inner` is also set in `outer`, i.e.
@@ -1354,26 +1328,33 @@ mod tests {
     }
 
     #[test]
-    fn test_nesting_aware_dedupes_exact_duplicates() {
-        // Identical contours (duplicate-name ROI merge artifact) must not
-        // cancel to empty under nesting classification.
+    fn test_nesting_aware_keeps_duplicates_in_any_encoding() {
+        // Duplicate contours from a duplicate-name ROI merge must not cancel —
+        // including when the duplicate uses a different vertex encoding
+        // (reversed winding here). Strict-containment classification treats
+        // mutually-contained masks as the same solid region.
         let sq = Contour {
             points: vec![[0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [0.0, 6.0]],
             contour_type: ContourType::External,
         };
-        let contours = vec![sq.clone(), sq];
+        let reversed = Contour {
+            points: vec![[0.0, 6.0], [6.0, 6.0], [6.0, 0.0], [0.0, 0.0]],
+            contour_type: ContourType::External,
+        };
         let col_lut: Vec<f64> = (0..=6).map(|v| v as f64).collect();
         let row_lut: Vec<f64> = (0..=6).map(|v| v as f64).collect();
 
-        let mask = build_combined_mask(
-            &contours,
-            &col_lut,
-            &row_lut,
-            0,
-            ContourCombineMode::NestingAware,
-        )
-        .unwrap();
-        assert!(mask[[3, 3]]);
+        for contours in [vec![sq.clone(), sq.clone()], vec![sq.clone(), reversed]] {
+            let mask = build_combined_mask(
+                &contours,
+                &col_lut,
+                &row_lut,
+                0,
+                ContourCombineMode::NestingAware,
+            )
+            .unwrap();
+            assert!(mask[[3, 3]], "duplicate contours must not cancel the solid");
+        }
     }
 
     #[test]
