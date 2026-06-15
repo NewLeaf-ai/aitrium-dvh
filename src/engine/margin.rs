@@ -349,6 +349,16 @@ fn collect_directional_clearances(
     let mut clearances = Vec::with_capacity(boundary_voxels.len());
     let cos_threshold = cone_degrees.to_radians().cos();
 
+    // Conservative quantization floor (AIT-746): the binary-mask EDT measures
+    // center-to-center distance, so an inside boundary voxel reads up to ~one
+    // voxel step too far from the true boundary, which would OVER-report
+    // clearance (the clinically unsafe direction — a too-tight margin could
+    // falsely pass). Subtract an upper bound on that quantization error so the
+    // reported clearance is never optimistic; this under-reports by < one voxel
+    // (safe: borderline cases get flagged for review). AIT-746 replaces this
+    // floor with accurate sub-voxel distance to recover the lost precision.
+    let quantization_mm = dx_mm.max(dy_mm).max(dz_mm);
+
     for &(k, i, j) in boundary_voxels {
         if let Some(dir) = direction_vector {
             let Some(sdf_inner) = sdf_inner else {
@@ -368,13 +378,7 @@ fn collect_directional_clearances(
         if !signed_distance.is_finite() {
             continue;
         }
-        // KNOWN LIMITATION (AIT-746): the binary-mask EDT measures center-to-
-        // center distance, so an inside boundary voxel reads ~1 voxel from the
-        // boundary. Coincident/touching ROIs therefore over-report clearance by
-        // ~one voxel spacing (non-conservative). A sub-voxel / zero-level-offset
-        // fix with analytic validation is tracked separately before B1b relies
-        // on these margin facts.
-        clearances.push(-signed_distance);
+        clearances.push(-signed_distance - quantization_mm);
     }
 
     clearances
@@ -1518,7 +1522,11 @@ mod tests {
         let merged =
             merge_matching_rois(&[outer_part_a.clone(), outer_part_b.clone()], "PTV").unwrap();
         let merged_result = compute_margin_rtstruct_v2(&inner, &merged, &opts).unwrap();
-        assert!(merged_result.summary_mm > 0.0);
+        // Intent: merging the duplicate-name ROIs fixes the false protrusion.
+        // Assert the improvement relatively so the conservative quantization
+        // floor (which shifts all clearances down ~1 voxel) doesn't make this
+        // single-plane geometry's thin z-clearance flip the absolute sign.
+        assert!(merged_result.summary_mm > bad_single.summary_mm);
     }
 
     #[test]
@@ -1552,9 +1560,29 @@ mod tests {
 
     #[test]
     fn test_margin_rtstruct_v2_directional_posterior_reduced() {
-        let inner = make_rect_roi("CTV", -10.0, 10.0, -10.0, 10.0, &[-2.0, 0.0, 2.0], 2.0);
-        // Posterior (+Y) margin is 3mm, anterior (-Y) margin is 7mm
-        let outer = make_rect_roi("PTV", -15.0, 15.0, -17.0, 13.0, &[-2.0, 0.0, 2.0], 2.0);
+        // Enough z-extent that directional P05 sampling is well-conditioned (so
+        // the conservative quantization floor doesn't leave the comparison
+        // noise-dominated), mirroring the uniform-nested test.
+        let inner = make_rect_roi(
+            "CTV",
+            -10.0,
+            10.0,
+            -10.0,
+            10.0,
+            &[-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0],
+            2.0,
+        );
+        // Posterior margin is 3mm (outer +13 vs inner +10), anterior is 7mm
+        // (outer -17 vs inner -10).
+        let outer = make_rect_roi(
+            "PTV",
+            -15.0,
+            15.0,
+            -17.0,
+            13.0,
+            &[-8.0, -6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0],
+            2.0,
+        );
 
         let mut opts = MarginOptions::default();
         opts.xy_resolution_mm = 1.0;
@@ -1562,6 +1590,8 @@ mod tests {
         opts.direction = Some(MarginDirection::Posterior);
 
         let posterior = compute_margin_rtstruct_v2(&inner, &outer, &opts).unwrap();
+        // Posterior directional margin reflects the 3mm posterior gap. Band
+        // accommodates the conservative quantization floor (~1 voxel under).
         assert!(posterior.summary_mm.is_finite());
         assert!(posterior.summary_mm > 1.0 && posterior.summary_mm < 5.0);
     }
