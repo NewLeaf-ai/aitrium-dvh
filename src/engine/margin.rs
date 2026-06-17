@@ -78,7 +78,16 @@ pub struct MarginResult {
     pub coverage_within_thresholds: Vec<(f64, f64)>,
 }
 
-/// Compute margin from ROI A to ROI B by name
+/// Compute margin from ROI A to ROI B by name (RTDOSE-backed path).
+///
+/// SIGN CONVENTION (AIT-749): this path reports **raw signed distance** to the
+/// target boundary (inside-target = negative), which is the OPPOSITE sign of the
+/// RTSTRUCT-only v2 path (`compute_margin_directed_rtstruct`), whose `summary_mm`
+/// is **clearance** (positive = source inside target with margin). The v2
+/// clearance convention is the canonical one used for QA facts (newleaf-native,
+/// node `rt_margin`); this RTDOSE path is retained for diagnostic comparison
+/// (e.g. newleaf-native's env-gated `[QA_MARGIN_COMPARE]` logging) and is NOT a
+/// stored fact. Don't mix the two conventions in a single threshold check.
 ///
 /// This is a directed measurement: distances from A → B
 /// (not symmetric, A→B ≠ B→A)
@@ -297,12 +306,24 @@ fn compute_margin_rtstruct_v2(
                 return Ok(infinite_margin_result(options));
             }
 
+            // Sample-count-weighted mean over the combined left+right samples
+            // (an unweighted (L+R)/2 average biases asymmetric structures where
+            // one side contributes far more boundary voxels). AIT-747.
+            let combined_count = left_result.sample_count + right_result.sample_count;
+            let weighted_mean = if combined_count > 0 {
+                (left_result.mean_mm * left_result.sample_count as f64
+                    + right_result.mean_mm * right_result.sample_count as f64)
+                    / combined_count as f64
+            } else {
+                (left_result.mean_mm + right_result.mean_mm) / 2.0
+            };
+
             Ok(MarginResult {
                 min_mm: left_result.min_mm.min(right_result.min_mm),
                 p05_mm: left_result.p05_mm.min(right_result.p05_mm),
                 p50_mm: left_result.p50_mm.min(right_result.p50_mm),
                 p95_mm: left_result.p95_mm.min(right_result.p95_mm),
-                mean_mm: (left_result.mean_mm + right_result.mean_mm) / 2.0,
+                mean_mm: weighted_mean,
                 summary_mm: left_result.summary_mm.min(right_result.summary_mm),
                 summary_percentile: options.summary_percentile.clamp(0.0, 100.0),
                 sample_count: left_result.sample_count + right_result.sample_count,
@@ -349,16 +370,18 @@ fn collect_directional_clearances(
     let mut clearances = Vec::with_capacity(boundary_voxels.len());
     let cos_threshold = cone_degrees.to_radians().cos();
 
-    // Conservative quantization floor (AIT-746): the binary-mask EDT measures
-    // center-to-center distance, so an inside boundary voxel reads up to ~one
-    // voxel step too far from the true boundary, which would OVER-report
-    // clearance (the clinically unsafe direction — a too-tight margin could
-    // falsely pass). Subtract an upper bound on that quantization error so the
-    // reported clearance is never optimistic; this under-reports by < one voxel
-    // (safe: borderline cases get flagged for review). AIT-746 replaces this
-    // floor with accurate sub-voxel distance to recover the lost precision.
-    let quantization_mm = dx_mm.max(dy_mm).max(dz_mm);
-
+    // Report the raw signed-distance clearance, matching newleaf-native (the
+    // established submission-time computation) for cross-engine parity.
+    //
+    // NOTE (AIT-746): a prior node-side "conservative quantization floor" that
+    // subtracted max(dx,dy,dz) per sample was REMOVED — on anisotropic grids it
+    // subtracted the full z slice thickness (e.g. 2.5mm) from an in-plane
+    // margin, under-reporting by ~57% and, critically, diverging the node from
+    // newleaf-native/cloud (a never-fork violation, since the correction was
+    // one-sided). The genuine ~0.5-1 voxel binary-mask EDT over-read at
+    // coincident boundaries is to be corrected with accurate sub-voxel distance
+    // in the SHARED core (so native/node/cloud move together) — tracked in
+    // AIT-746.
     for &(k, i, j) in boundary_voxels {
         if let Some(dir) = direction_vector {
             let Some(sdf_inner) = sdf_inner else {
@@ -378,7 +401,7 @@ fn collect_directional_clearances(
         if !signed_distance.is_finite() {
             continue;
         }
-        clearances.push(-signed_distance - quantization_mm);
+        clearances.push(-signed_distance);
     }
 
     clearances
@@ -480,7 +503,17 @@ fn build_synthetic_grid(
     let mut dz_mm = if options.z_resolution_mm > 0.0 {
         options.z_resolution_mm
     } else {
-        derive_default_z_resolution(roi_a, roi_b)
+        // When z-interpolation is requested without an explicit z resolution,
+        // refine the grid to the interpolated plane spacing (base /
+        // (segments + 1)); otherwise the interpolated planes never land on the
+        // z-LUT and interpolation is a silent no-op (AIT-747).
+        let base = derive_default_z_resolution(roi_a, roi_b);
+        let segments = options.interpolation_segments_between_planes;
+        if segments > 0 {
+            base / (segments as f64 + 1.0)
+        } else {
+            base
+        }
     }
     .max(0.2);
 
@@ -564,7 +597,17 @@ fn voxelize_roi_on_grid(
     }
 
     let plane_zs: Vec<f64> = planes.keys().map(|k| k.0).collect();
-    let z_tolerance = (grid.dz_mm * 0.75).max(roi.thickness_mm * 0.5).max(0.5);
+    // Scale the slab tolerance with the *interpolated* plane spacing. Using the
+    // original thickness here over-extends end/padded slices once the grid is
+    // refined for interpolation (the refined planes sit closer than the
+    // original thickness) — AIT-747.
+    let segments = options.interpolation_segments_between_planes;
+    let effective_thickness = if segments > 0 {
+        roi.thickness_mm / (segments as f64 + 1.0)
+    } else {
+        roi.thickness_mm
+    };
+    let z_tolerance = (grid.dz_mm * 0.75).max(effective_thickness * 0.5).max(0.5);
 
     for (k, &z) in grid.z_lut.iter().enumerate() {
         let Some(nearest_z) = find_nearest_z(&plane_zs, z) else {
@@ -677,15 +720,22 @@ fn local_outward_normal(
 }
 
 fn direction_to_lps_vector(direction: MarginDirection) -> Option<[f64; 3]> {
+    // RTSTRUCT ContourData lives in the DICOM patient LPS coordinate system
+    // (+X = Left, +Y = Posterior, +Z = Superior), and the synthetic grid is
+    // built directly from those points (col_lut = X, row_lut = Y, z = Z). So
+    // anatomical directions are FIXED in this frame and do NOT vary with
+    // PatientPosition — map to fixed LPS axes. This matches newleaf-native (the
+    // parity reference). Patient-position adjustment (direction_to_vector)
+    // applies only to image/pixel-space paths (the RTDOSE path), never here.
+    // (AIT-749 — reverted an incorrect patient-position threading.)
     match direction {
-        // Uniform/Lateral have no single axis and are handled specially by the
-        // v2 caller. Every other direction uses the SHARED, patient-aware
-        // convention (direction_to_vector) so the RTSTRUCT-only path agrees with
-        // compute_margin_directed instead of inverting Posterior/Anterior. The
-        // v2 path has no patient-position source, so it assumes HFS — the same
-        // default direction_to_vector uses.
         MarginDirection::Uniform | MarginDirection::Lateral => None,
-        other => Some(direction_to_vector(other, None)),
+        MarginDirection::Left => Some([1.0, 0.0, 0.0]),
+        MarginDirection::Right => Some([-1.0, 0.0, 0.0]),
+        MarginDirection::Posterior => Some([0.0, 1.0, 0.0]),
+        MarginDirection::Anterior => Some([0.0, -1.0, 0.0]),
+        MarginDirection::Superior => Some([0.0, 0.0, 1.0]),
+        MarginDirection::Inferior => Some([0.0, 0.0, -1.0]),
     }
 }
 
@@ -1583,14 +1633,14 @@ mod tests {
             &[-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0],
             2.0,
         );
-        // Shared convention: HFS posterior = -Y. Posterior gap is 3mm (inner
-        // -10 vs outer -13); anterior (+Y) gap is 7mm (inner 10 vs outer 17).
+        // Fixed LPS: posterior = +Y. Posterior gap is 3mm (inner +10 vs outer
+        // +13); anterior (-Y) gap is 7mm (inner -10 vs outer -17).
         let outer = make_rect_roi(
             "PTV",
             -15.0,
             15.0,
-            -13.0,
-            17.0,
+            -17.0,
+            13.0,
             &[-8.0, -6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0],
             2.0,
         );
@@ -1601,8 +1651,7 @@ mod tests {
         opts.direction = Some(MarginDirection::Posterior);
 
         let posterior = compute_margin_rtstruct_v2(&inner, &outer, &opts).unwrap();
-        // Posterior directional margin reflects the 3mm posterior gap. Band
-        // accommodates the conservative quantization floor (~1 voxel under).
+        // Posterior directional margin reflects the 3mm posterior gap.
         assert!(posterior.summary_mm.is_finite());
         assert!(posterior.summary_mm > 1.0 && posterior.summary_mm < 5.0);
     }
@@ -1630,6 +1679,13 @@ mod tests {
         assert!(left.summary_mm.is_finite() && right.summary_mm.is_finite());
         let expected = left.summary_mm.min(right.summary_mm);
         assert!((lateral.summary_mm - expected).abs() < 0.5);
+
+        // mean_mm is the sample-count-weighted combination of both sides, not a
+        // plain (L+R)/2 average (AIT-747).
+        let lc = left.sample_count as f64;
+        let rc = right.sample_count as f64;
+        let weighted = (left.mean_mm * lc + right.mean_mm * rc) / (lc + rc);
+        assert!((lateral.mean_mm - weighted).abs() < 1e-6);
     }
 
     #[test]
@@ -1643,5 +1699,55 @@ mod tests {
         opts.z_resolution_mm = 1.0;
         let result = compute_margin_rtstruct_v2(&inner, &outer, &opts).unwrap();
         assert!(result.summary_mm < 0.0);
+    }
+
+    #[test]
+    fn test_z_interpolation_refines_grid_at_default_resolution() {
+        // With z_resolution_mm = 0 (auto) and an interpolation request, the
+        // synthetic grid must refine to the interpolated plane spacing — else
+        // the interpolated planes never land on the z-LUT and interpolation is
+        // a silent no-op (AIT-747).
+        let a = make_rect_roi("CTV", -10.0, 10.0, -10.0, 10.0, &[-2.0, 0.0, 2.0], 2.0);
+        let b = make_rect_roi("PTV", -15.0, 15.0, -15.0, 15.0, &[-2.0, 0.0, 2.0], 2.0);
+
+        let mut opts = MarginOptions::default();
+        opts.xy_resolution_mm = 1.0; // z_resolution_mm stays 0.0 (auto)
+        let grid0 = build_synthetic_grid(&a, &b, &opts).unwrap();
+
+        let mut opts1 = opts.clone();
+        opts1.interpolation_segments_between_planes = 1;
+        let grid1 = build_synthetic_grid(&a, &b, &opts1).unwrap();
+
+        // One interpolation segment halves the auto z spacing.
+        assert!(grid1.dz_mm < grid0.dz_mm);
+        assert!((grid1.dz_mm - grid0.dz_mm / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_direction_to_lps_vector_is_fixed_lps() {
+        // RTSTRUCT-only directions are fixed LPS (Posterior=+Y, Left=+X,
+        // Superior=+Z), independent of patient position, matching native (AIT-749).
+        assert_eq!(
+            direction_to_lps_vector(MarginDirection::Posterior),
+            Some([0.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            direction_to_lps_vector(MarginDirection::Anterior),
+            Some([0.0, -1.0, 0.0])
+        );
+        assert_eq!(
+            direction_to_lps_vector(MarginDirection::Left),
+            Some([1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            direction_to_lps_vector(MarginDirection::Right),
+            Some([-1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            direction_to_lps_vector(MarginDirection::Superior),
+            Some([0.0, 0.0, 1.0])
+        );
+        assert_eq!(direction_to_lps_vector(MarginDirection::Uniform), None);
+        assert_eq!(direction_to_lps_vector(MarginDirection::Lateral), None);
     }
 }
